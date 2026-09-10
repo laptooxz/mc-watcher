@@ -1,0 +1,575 @@
+#!/bin/sh
+# mc-watcher — Minecraft server log watcher daemon
+# Automatically detects active MC servers and sends notifications for events.
+# Runs as an OpenRC service. No fish dependency.
+# Watches ALL active mc-* tmux sessions (one background tail per server).
+
+export HOME=/home/main
+export PATH=/home/main/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+LOG_DIR=~/mc
+WATCHER_LOG="$LOG_DIR/mc_watcher.log"
+EXCLUDE_SESSION="mc-watcher"
+
+SOUNDS_DIR="$HOME/mc/library/sounds"
+EVENTS_FILE="/srv/logs/mc_events.jsonl"
+STATE_DIR="/tmp/mc-watcher"
+mkdir -p "$STATE_DIR"
+
+log_event() {
+    local srv="$1" msg="$2"
+    local line="$(date '+%Y-%m-%d %H:%M:%S') [$srv] $msg"
+    echo "$line"
+    echo "$line" >> "$WATCHER_LOG"
+}
+
+log_jsonl() {
+    local server="$1" event="$2"
+    shift 2
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    local extra=""
+    while [ $# -ge 2 ]; do
+        [ -n "$extra" ] && extra="$extra,"
+        extra="$extra\"$1\":\"$2\""
+        shift 2
+    done
+    [ -n "$extra" ] && extra=",$extra"
+    echo "{\"ts\":\"$ts\",\"server\":\"$server\",\"event\":\"$event\"$extra}" >> "$EVENTS_FILE"
+}
+
+notify() {
+    local title="$1" msg="$2" sound_name="$3" md_msg="$4"
+
+    command -v notify-send >/dev/null 2>&1 && \
+        hostenv notify-send -a laptooMC -i minecraft "$title" "$msg" >/dev/null 2>&1 &
+
+    if [ -n "$sound_name" ] && [ -d "$SOUNDS_DIR" ]; then
+        local sound=""
+        case "$sound_name" in
+            start)          sound="$SOUNDS_DIR/block/beacon/activate.ogg" ;;
+            stop)           sound="$SOUNDS_DIR/block/beacon/deactivate.ogg" ;;
+            ready)          sound="$SOUNDS_DIR/random/levelup.ogg" ;;
+            join)           sound="$SOUNDS_DIR/note/pling.ogg" ;;
+            leave)          sound="$SOUNDS_DIR/random/break.ogg" ;;
+            death)          sound="$SOUNDS_DIR/mob/wither/spawn.ogg" ;;
+            kick)           sound="$SOUNDS_DIR/mob/wither/spawn.ogg" ;;
+            gamemode)       sound="$SOUNDS_DIR/random/orb.ogg" ;;
+            chunky-start)   sound="$SOUNDS_DIR/random/orb.ogg" ;;
+            chunky-finish)  sound="$SOUNDS_DIR/item/goat_horn/call0.ogg" ;;
+            grim)           sound="$SOUNDS_DIR/random/click.ogg" ;;
+            kick-ac)        sound="$SOUNDS_DIR/mob/ravager/roar1.ogg" ;;
+            ban)            sound="$SOUNDS_DIR/mob/wither/spawn.ogg" ;;
+            *)              sound="$SOUNDS_DIR/random/orb.ogg" ;;
+        esac
+        [ -f "$sound" ] && hostenv paplay "$sound" >/dev/null 2>&1 &
+    fi
+
+    if [ -n "$md_msg" ]; then
+        command -v ntfy-push >/dev/null 2>&1 && \
+            ntfy-push mc "$title" "$md_msg" 3 markdown &
+    else
+        command -v ntfy-push >/dev/null 2>&1 && \
+            ntfy-push mc "$title" "$msg" &
+    fi
+}
+
+# Strip [ip]/…(uuid) suffixes and trim whitespace.
+# (Fabric logs "svxvx (uuid) lost connection" — without the trim the
+# name keeps a trailing space and notifications render as "**svxvx **".)
+clean_name() {
+    echo "$1" | sed 's/[[(].*//;s/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# Join dedup (per server): same player within 20s = duplicate line.
+# Paper prints "joined the game" THEN "logged in"; Fabric prints
+# "logged in", "Player [x] joined.", "joined the game" — either order
+# yields exactly one ping.
+join_is_dup() {
+    local srv="$1" player="$2" now fp fts
+    now=$(date +%s)
+    [ -f "$STATE_DIR/$srv.join-seen" ] || return 1
+    fp=$(cut -d: -f1 "$STATE_DIR/$srv.join-seen" 2>/dev/null)
+    fts=$(cut -d: -f2 "$STATE_DIR/$srv.join-seen" 2>/dev/null)
+    [ "$fp" = "$player" ] || return 1
+    fts="${fts:-0}"
+    [ "$((now - fts))" -lt 20 ] && return 0
+    return 1
+}
+join_mark() {
+    echo "$1:$(date +%s)" > "$STATE_DIR/$2.join-seen"
+}
+join_clear() {
+    rm -f "$STATE_DIR/$1.join-seen"
+}
+
+# Leave echo guard (per server): Paper+Fabric print BOTH
+# "lost connection" and "left the game" — skip the second one.
+leave_just_seen() {
+    local srv="$1" player="$2" now lp lts
+    now=$(date +%s)
+    [ -f "$STATE_DIR/$srv.leave-seen" ] || return 1
+    lp=$(cut -d: -f1 "$STATE_DIR/$srv.leave-seen" 2>/dev/null)
+    lts=$(cut -d: -f2 "$STATE_DIR/$srv.leave-seen" 2>/dev/null)
+    [ "$lp" = "$player" ] || return 1
+    lts="${lts:-0}"
+    [ "$((now - lts))" -lt 10 ] && return 0
+    return 1
+}
+leave_mark() {
+    echo "$1:$(date +%s)" > "$STATE_DIR/$2.leave-seen"
+}
+
+# Escape dots so ".DarkPulse8346" doesn't regex-match "XDarkPulse8346".
+regex_escape() {
+    echo "$1" | sed 's/\./\\./g'
+}
+
+AC_DEDUP_FILE="/tmp/mc-watcher-ac-dedup"
+AC_COOLDOWN=300
+check_ac_dedup() {
+    local player="$1" esc now entry last
+    esc=$(regex_escape "$player")
+    now=$(date +%s)
+    entry=$(grep "^$esc:" "$AC_DEDUP_FILE" 2>/dev/null | head -n 1)
+    if [ -n "$entry" ]; then
+        last=$(echo "$entry" | cut -d: -f2)
+        last="${last:-0}"
+        if [ "$((now - last))" -lt "$AC_COOLDOWN" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+set_ac_dedup() {
+    local player="$1" now tmp
+    now=$(date +%s)
+    # drop own stale entry + any entry older than the cooldown (keeps file tiny)
+    if [ -f "$AC_DEDUP_FILE" ]; then
+        tmp="$AC_DEDUP_FILE.tmp"
+        awk -F: -v now="$now" -v cool="$AC_COOLDOWN" -v pl="$player" \
+            '$1 != pl && $2 + 0 + cool > now' "$AC_DEDUP_FILE" 2>/dev/null > "$tmp" \
+            && mv "$tmp" "$AC_DEDUP_FILE"
+    fi
+    echo "$player:$now" >> "$AC_DEDUP_FILE"
+}
+
+process_line() {
+    local srv="$1" line="$2"
+
+    # Server ready (fire once per boot — Fabric prints Done twice: vanilla + Geyser)
+    case "$line" in
+        *"For help, type"*)
+            [ -f "$STATE_DIR/$srv.ready" ] && return
+            touch "$STATE_DIR/$srv.ready"
+            local time
+            time=$(echo "$line" | sed -n 's/.*(\([0-9.]*\)s).*/\1/p')
+            log_event "$srv" "Ready (${time}s)"
+            log_jsonl "$srv" "server_ready" "uptime" "$time"
+            notify "$srv" "Server finished starting in ${time}s" "ready" "**$srv** finished starting in \`${time}s\`"
+            return
+            ;;
+    esac
+
+    # GrimAC cheat flag: Grim » player failed check (xVL)
+    case "$line" in
+        *"Grim »"*"failed"*)
+            local player check vl
+            player=$(clean_name "$(echo "$line" | sed -n 's/.*Grim » \(.*\) failed .*/\1/p')")
+            check=$(echo "$line" | sed -n 's/.*failed \(.*\) (x[0-9]*.*/\1/p')
+            vl=$(echo "$line" | sed -n 's/.*(x\([0-9]*\)).*/\1/p')
+            if [ -n "$player" ] && [ -n "$check" ]; then
+                log_event "$srv" "$player flagged for $check (VL=$vl)"
+                log_jsonl "$srv" "cheat_flag" "player" "$player" "check" "$check" "vl" "$vl"
+                notify "$srv" "$player flagged $check" "grim" "**$player** flagged by GrimAC: \`$check\` (VL=$vl)"
+            fi
+            return
+            ;;
+    esac
+
+    # AdvancedBan tempban execution
+    case "$line" in
+        *"[AdvancedBanX] Executing command: tempban"*)
+            local player duration reason
+            player=$(clean_name "$(echo "$line" | sed -n 's/.*tempban \([^ ]*\) .*/\1/p')")
+            [ -z "$player" ] && return
+            duration=$(echo "$line" | sed -n 's/.*tempban [^ ]* \([^ ]*\) \([^ ]*\).*/\1/p')
+            reason=$(echo "$line" | sed -n 's/.*tempban [^ ]* [^ ]* [^ ]* \(.*\)/\1/p')
+            check_ac_dedup "$player" && return; set_ac_dedup "$player"
+            log_event "$srv" "$player tempbanned ($duration $reason)"
+            log_jsonl "$srv" "player_banned" "player" "$player" "duration" "$duration" "reason" "$reason"
+            notify "$srv" "$player banned $duration" "ban" "**$player** tempbanned from **$srv**\nDuration: \`$duration\`\nReason: $reason"
+            return
+            ;;
+    esac
+
+    # AdvancedBan kick disconnect (before general leave handler)
+    case "$line" in
+        *"lost connection: AdvancedBanX"*)
+            local player
+            player=$(clean_name "$(echo "$line" | sed -n 's/.*]: \(.*\) lost connection:.*/\1/p')")
+            [ -z "$player" ] && return
+            check_ac_dedup "$player" && return; set_ac_dedup "$player"
+            log_event "$srv" "$player kicked by AdvancedBan"
+            log_jsonl "$srv" "player_kicked" "player" "$player" "reason" "AdvancedBan"
+            notify "$srv" "$player kicked" "kick-ac" "**$player** kicked from **$srv** by AdvancedBan"
+            leave_mark "$player" "$srv"
+            join_clear "$srv"
+            return
+            ;;
+    esac
+
+    # Essentials gamemode: [player: Set own game mode to X Mode]
+    case "$line" in
+        *"Set own game mode to "*)
+            local player gm
+            player=$(clean_name "$(echo "$line" | sed -n 's/.*\[\(.*\): Set own game mode to.*/\1/p')")
+            gm=$(echo "$line" | sed -n 's/.*Set own game mode to \(.* Mode\)\].*/\1/p')
+            if [ -n "$player" ] && [ -n "$gm" ]; then
+                log_event "$srv" "$player → $gm"
+                log_jsonl "$srv" "gamemode_switch" "player" "$player" "mode" "$gm"
+                notify "$srv" "$player → $gm" "gamemode" "**$player** → **$gm**"
+            fi
+            return
+            ;;
+    esac
+
+    # Vanilla gamemode (console/rcon/op): Set <player>'s game mode to X Mode
+    case "$line" in
+        *"Set "*"'s game mode to "*)
+            local player gm
+            player=$(clean_name "$(echo "$line" | sed -n "s/.*Set \(.*\)'s game mode to.*/\1/p")")
+            gm=$(echo "$line" | sed -n 's/.*game mode to \(.* Mode\).*/\1/p')
+            if [ -n "$player" ] && [ -n "$gm" ]; then
+                log_event "$srv" "$player → $gm"
+                log_jsonl "$srv" "gamemode_switch" "player" "$player" "mode" "$gm"
+                notify "$srv" "$player → $gm" "gamemode" "**$player** → **$gm**"
+            fi
+            return
+            ;;
+    esac
+
+    # Fabric join line: Player [svxvx] joined.
+    case "$line" in
+        *"Player ["*"] joined."*)
+            local player
+            player=$(clean_name "$(echo "$line" | sed -n 's/.*Player \[\(.*\)\] joined\./\1/p')")
+            [ -z "$player" ] && return
+            join_is_dup "$srv" "$player" && return
+            log_event "$srv" "$player joined"
+            log_jsonl "$srv" "player_joined" "player" "$player"
+            notify "$srv" "$player joined" "join" "**$player** joined"
+            join_mark "$player" "$srv"
+            return
+            ;;
+    esac
+
+    # Player join — "joined the game"
+    case "$line" in
+        *"joined the game"*)
+            local player
+            player=$(clean_name "$(echo "$line" | sed -n 's/.*]: \(.*\) joined the game/\1/p')")
+            [ -z "$player" ] && return
+            join_is_dup "$srv" "$player" && return
+            log_event "$srv" "$player joined"
+            log_jsonl "$srv" "player_joined" "player" "$player"
+            notify "$srv" "$player joined" "join" "**$player** joined"
+            join_mark "$player" "$srv"
+            return
+            ;;
+    esac
+
+    # Player join — "logged in with entity id" (includes IP)
+    # Paper prints join BEFORE login, Fabric prints login FIRST —
+    # either way this yields exactly one ping thanks to join_is_dup.
+    case "$line" in
+        *"logged in with entity id"*)
+            local player ip
+            player=$(clean_name "$(echo "$line" | sed -n 's/.*]: \(.*\)\[\/.*/\1/p')")
+            [ -z "$player" ] && return
+            ip=$(echo "$line" | sed -n 's/.*]: .*\[\/\([0-9.]*\):.*/\1/p')
+            if join_is_dup "$srv" "$player"; then
+                # join already pinged — just enrich the event log with the IP
+                if [ -n "$ip" ]; then
+                    log_event "$srv" "$player joined ($ip)"
+                    log_jsonl "$srv" "player_joined" "player" "$player" "ip" "$ip"
+                fi
+                return
+            fi
+            if [ -n "$ip" ]; then
+                log_event "$srv" "$player joined ($ip)"
+                log_jsonl "$srv" "player_joined" "player" "$player" "ip" "$ip"
+                notify "$srv" "$player joined from $ip" "join" "**$player** joined from \`$ip\`"
+            else
+                log_event "$srv" "$player joined"
+                log_jsonl "$srv" "player_joined" "player" "$player"
+                notify "$srv" "$player joined" "join" "**$player** joined"
+            fi
+            join_mark "$player" "$srv"
+            return
+            ;;
+    esac
+
+    # Player kicked
+    case "$line" in
+        *"was kicked due to "*)
+            local player reason
+            player=$(clean_name "$(echo "$line" | sed -n 's/.*]: \(.*\) was kicked due to.*/\1/p')")
+            [ -z "$player" ] && return
+            reason=$(echo "$line" | sed -n 's/.*was kicked due to \(.*\)!/\1/p')
+            log_event "$srv" "$player was kicked ($reason)"
+            log_jsonl "$srv" "player_kicked" "player" "$player" "reason" "$reason"
+            notify "$srv" "$player was kicked — $reason" "kick" "**$player** was kicked\n> $reason"
+            leave_mark "$player" "$srv"
+            join_clear "$srv"
+            return
+            ;;
+    esac
+
+    # Player leave — "lost connection" (covers Fabric's "name (uuid) lost connection" too)
+    case "$line" in
+        *"lost connection:"*)
+            local player
+            player=$(clean_name "$(echo "$line" | sed -n 's/.*]: \(.*\) lost connection:.*/\1/p')")
+            [ -z "$player" ] && return
+            log_event "$srv" "$player left"
+            log_jsonl "$srv" "player_left" "player" "$player"
+            notify "$srv" "$player left" "leave" "**$player** left"
+            leave_mark "$player" "$srv"
+            join_clear "$srv"
+            return
+            ;;
+    esac
+
+    # Player leave — "left the game" fallback (servers that skip "lost connection").
+    # Paper+Fabric print both lines, so skip when "lost connection" just fired.
+    case "$line" in
+        *"left the game"*)
+            local player
+            player=$(clean_name "$(echo "$line" | sed -n 's/.*]: \(.*\) left the game/\1/p')")
+            [ -z "$player" ] && return
+            leave_just_seen "$srv" "$player" && return
+            log_event "$srv" "$player left"
+            log_jsonl "$srv" "player_left" "player" "$player"
+            notify "$srv" "$player left" "leave" "**$player** left"
+            leave_mark "$player" "$srv"
+            join_clear "$srv"
+            return
+            ;;
+    esac
+
+    # Console stop: "Stopping the server" (Paper + Fabric both log this,
+    # followed by "Stopping server"). Flag it so the session-death path can
+    # report a graceful stop vs an unexpected session loss. No ping here —
+    # the single "Server stopped" ping fires on session death.
+    case "$line" in
+        *"Stopping the server"*|*"Stopping server"*)
+            case "$(echo "$line" | sed -n 's/.*]: \(.*\)/\1/p')" in "<"*) return ;; esac
+            [ -f "$STATE_DIR/$srv.stopping" ] && return
+            touch "$STATE_DIR/$srv.stopping"
+            log_event "$srv" "Stop requested from console"
+            log_jsonl "$srv" "server_stopping" "message" "Stop requested from console"
+            return
+            ;;
+    esac
+
+    # Named mob/villager death with entity dump:
+    # Villager Villager['Cleric'/7650, uuid='…', l='ServerLevel[world]',
+    #   x=-1912.37, y=64.00, z=1391.57, cpos=[-120, 86], tl=36103, v=true]
+    #   died, message: 'Cleric was slain by Zombie'
+    case "$line" in
+        *"] died, message: '"*)
+            local inner msg name uuid lvl x y z body
+            inner=$(echo "$line" | sed -n "s/.*\['\(.*\)\] died, message:.*/\1/p")
+            msg=$(echo "$line" | sed -n "s/.*died, message: '\(.*\)'[^']*$/\1/p")
+            [ -z "$msg" ] && return
+            name=$(echo "$inner" | cut -d"'" -f1)
+            uuid=$(echo "$inner" | sed -n "s/.*uuid='\([^']*\)'.*/\1/p")
+            lvl=$(echo "$inner" | sed -n "s/.*l='\([^']*\)'.*/\1/p")
+            case "$lvl" in
+                ServerLevel\[*\]) lvl=$(echo "$lvl" | sed 's/^ServerLevel\[//;s/\]$//') ;;
+            esac
+            x=$(echo "$inner" | sed -n 's/.* x=\([^,} ]*\).*/\1/p')
+            y=$(echo "$inner" | sed -n 's/.* y=\([^,} ]*\).*/\1/p')
+            z=$(echo "$inner" | sed -n 's/.* z=\([^,} ]*\).*/\1/p')
+            body="$msg"
+            [ -n "$uuid" ] && body="$body
+uuid = $uuid"
+            if [ -n "$x" ] && [ -n "$y" ] && [ -n "$z" ]; then
+                body="$body
+x = $x, y = $y, z = $z"
+            fi
+            [ -n "$lvl" ] && body="$body
+level = $lvl"
+            log_event "$srv" "$msg"
+            log_jsonl "$srv" "player_died" "message" "$msg" "mob" "$name" "uuid" "$uuid" "x" "$x" "y" "$y" "z" "$z" "level" "$lvl"
+            notify "$srv" "$msg" "death" "$body"
+            return
+            ;;
+    esac
+
+    # Player death messages (full line = the message; title already says the server)
+    case "$line" in
+        *"was slain by "*|*"was shot by "*|*"was killed by "*|\
+        *"was blown up by "*|*"was fireballed by "*|*"was impaled by "*|\
+        *"was impaled on "*|*"was skewered by "*|*"was skewered "*|\
+        *"was smashed by "*|*"was smashed "*|*"was squashed by "*|*"was squashed "*|\
+        *"was pummeled by "*|*"was pummeled "*|\
+        *"was stung by "*|*"was stung to death"*|*"was pricked by "*|*"was pricked to death"*|\
+        *"was poked by "*|*"was poked to death"*|\
+        *"was squished by "*|*"was squished "*|*"was crushed by "*|*"was doomed by "*|\
+        *"got finished off by "*|*"was finished off by "*|\
+        *"fell from "*|*"fell off "*|*"fell into "*|*"fell out of the world"*|\
+        *"was doomed to fall"*|*"didn't want to live in the same world"*|\
+        *"drowned"*|*"suffocated"*|*"blew up"*|*"went off with a bang"*|\
+        *"hit the ground"*|*"experienced kinetic energy"*|\
+        *"went up in flames"*|*"burned to death"*|*"was burned to a crisp"*|\
+        *"walked into fire"*|*"tried to swim in lava"*|*"discovered the floor was lava"*|\
+        *"starved to death"*|*"froze to death"*|*"was frozen to death"*|\
+        *"withered away"*|*"was struck by lightning"*|\
+        *"was killed by magic"*|*"fell off a ladder"*|*"fell off some vines"*|\
+        *"hit a wall"*|*"left the confines"*)
+            local death_msg
+            death_msg=$(echo "$line" | sed -n 's/.*]: \(.*\)/\1/p')
+            # player chat can contain death verbs ("I fell off lol") — skip it
+            case "$death_msg" in "<"*) return ;; esac
+            [ -z "$death_msg" ] && return
+            log_event "$srv" "$death_msg"
+            log_jsonl "$srv" "player_died" "message" "$death_msg"
+            notify "$srv" "$death_msg" "death" "$death_msg"
+            return
+            ;;
+    esac
+
+    # Chunky start
+    case "$line" in
+        *"[Chunky] Task started"*)
+            local radius
+            radius=$(echo "$line" | sed -n 's/.*radius \([0-9]*\).*/\1/p')
+            [ -z "$radius" ] && return
+            log_event "$srv" "Chunky r=$radius"
+            log_jsonl "$srv" "chunky_start" "radius" "$radius"
+            notify "$srv" "Generating chunks r=$radius" "chunky-start" "**$srv** — Generating chunks \`r=$radius\`"
+            return
+            ;;
+    esac
+
+    # Chunky finish
+    case "$line" in
+        *"[Chunky] Task finished"*)
+            local time chunks world_name
+            world_name=$(echo "$line" | sed -n 's/.*Task finished for \(.*\)\..*/\1/p')
+            chunks=$(echo "$line" | sed -n 's/.*Processed: \([0-9]*\) chunks.*/\1/p')
+            time=$(echo "$line" | sed -n 's/.*Total time: \(.*\)/\1/p')
+            [ -z "$world_name" ] && [ -z "$chunks" ] && return
+            log_event "$srv" "Chunky finished $world_name, $chunks chunks in $time"
+            log_jsonl "$srv" "chunky_finish" "world" "$world_name" "chunks" "$chunks" "time" "$time"
+            notify "$srv" "$world_name: $chunks chunks in $time" "chunky-finish" "**$world_name**: **$chunks** chunks in \`$time\`"
+            return
+            ;;
+    esac
+}
+
+watch_server() {
+    local srv="$1"
+    local log="$HOME/mc/$srv/logs/latest.log"
+    local posfile="$STATE_DIR/$srv.pos"
+
+    while [ ! -f "$log" ]; do
+        sleep 1
+        tmux has-session -t "mc-$srv" 2>/dev/null || return 1
+    done
+
+    log_event "$srv" "Watching $srv"
+    log_jsonl "$srv" "server_started"
+    rm -f "$STATE_DIR/$srv.ready" "$STATE_DIR/$srv.join-seen" "$STATE_DIR/$srv.leave-seen"
+
+    # Byte-based tracking — survives log rotation
+    wc -c < "$log" > "$posfile"
+
+    while true; do
+        tmux has-session -t "mc-$srv" 2>/dev/null || break
+
+        local total
+        total=$(wc -c < "$log" 2>/dev/null)
+        local pos
+        pos=$(cat "$posfile" 2>/dev/null)
+
+        # Log rotation: file shrunk → reset position
+        if [ "$total" -lt "$pos" ] 2>/dev/null; then
+            pos=0
+            echo "0" > "$posfile"
+        fi
+
+        if [ "$total" -gt "$pos" ] 2>/dev/null; then
+            local new_lines now2 NL partial plen
+            # exact byte range — dd's count caps the read, so lines appended
+            # between the wc and the read can't be over-read and then
+            # duplicated on the next poll
+            new_lines=$(dd if="$log" bs=1 skip="$pos" count="$((total - pos))" 2>/dev/null)
+            echo "$total" > "$posfile"
+            # file grew mid-read? the tail may be a partial line — hold it back
+            now2=$(wc -c < "$log" 2>/dev/null)
+            if [ "$now2" -gt "$total" ] 2>/dev/null; then
+                NL=$(printf '\nX'); NL=${NL%X}
+                case "$new_lines" in
+                    *"$NL"*)
+                        partial=${new_lines##*$NL}
+                        new_lines=${new_lines%$NL$partial}
+                        # rewind past the partial tail only (the \n stays
+                        # consumed as part of the previous complete line)
+                        plen=$(printf '%s' "$partial" | wc -c)
+                        echo "$((total - plen))" > "$posfile"
+                        ;;
+                    *)
+                        echo "$pos" > "$posfile"
+                        new_lines=""
+                        ;;
+                esac
+            fi
+
+            if [ -n "$new_lines" ]; then
+            echo "$new_lines" | while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                process_line "$srv" "$line"
+            done
+            fi
+        fi
+
+        sleep 2
+    done
+
+    # Session death: graceful (console `stop` seen) vs unexpected (crash/kill).
+    if [ -f "$STATE_DIR/$srv.stopping" ]; then
+        rm -f "$STATE_DIR/$srv.stopping"
+        log_event "$srv" "Server stopped"
+        log_jsonl "$srv" "server_stopped"
+        notify "$srv" "Server stopped" "stop" "Server stopped"
+    else
+        log_event "$srv" "Server stopped unexpectedly"
+        log_jsonl "$srv" "server_stopped" "cause" "session lost"
+        notify "$srv" "Server stopped unexpectedly" "stop" "Server stopped unexpectedly"
+    fi
+}
+
+log_event "watcher" "mc-watcher started"
+
+# One background tail per active server (previously only the first
+# mc-* session was watched, so other servers' events were never caught).
+while true; do
+    for session in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
+        case "$session" in
+            mc-*)
+                srv="${session#mc-}"
+                [ "$srv" = "$EXCLUDE_SESSION" ] && continue
+                pidf="$STATE_DIR/watch-$srv.pid"
+                if [ -f "$pidf" ]; then
+                    kill -0 "$(cat "$pidf" 2>/dev/null)" 2>/dev/null && continue
+                fi
+                watch_server "$srv" &
+                echo $! > "$pidf"
+                ;;
+        esac
+    done
+    sleep 5
+done
