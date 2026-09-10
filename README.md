@@ -2,8 +2,6 @@
 
 A lightweight Minecraft server log watcher daemon in a single POSIX shell script. Tails every active `mc-*` tmux session's `logs/latest.log` and fires notifications for joins, leaves, deaths, kicks, gamemode switches, and boot/stop events.
 
-Borrowed from the [LAPTOO homelab](https://laptoo.xyz) (Alpine Linux / OpenRC).
-
 > **yep this is vibecoded aswell**
 
 ## Requirements
