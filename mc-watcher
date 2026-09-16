@@ -539,6 +539,21 @@ watch_server() {
         sleep 2
     done
 
+    # Final drain after session dies: the last 2s window may have contained
+    # "Stopping the server" / "Stopping server" — the loop broke before
+    # reading it, so the graceful flag was never set and we mis-reported
+    # "unexpectedly" for normal `mc stop`.
+    _total=$(wc -c < "$log" 2>/dev/null) || _total=0
+    _pos=$(cat "$posfile" 2>/dev/null) || _pos=0
+    if [ "$_total" -gt "$_pos" ] 2>/dev/null; then
+        _new=$(dd if="$log" bs=1 skip="$_pos" count="$((_total - _pos))" 2>/dev/null)
+        echo "$_total" > "$posfile"
+        echo "$_new" | while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            process_line "$srv" "$line"
+        done
+    fi
+
     # Session death: graceful (console `stop` seen) vs unexpected (crash/kill).
     if [ -f "$STATE_DIR/$srv.stopping" ]; then
         rm -f "$STATE_DIR/$srv.stopping"
