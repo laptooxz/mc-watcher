@@ -10,6 +10,23 @@ A lightweight Minecraft server log watcher daemon in a single POSIX shell script
 > as-is, and it has no CI, no test suite and no security audit. Read the source
 > before running it anywhere that matters.
 
+> ### ⚠️ Deliberately not made configurable
+>
+> Unlike [`mc-go`](https://github.com/laptooxz/mc-go), this project **will not
+> get a config file, a `mc-watcher config` command, or a round of portability
+> work.** I looked at doing it and decided against it: the script is one big
+> pile of interleaved state — per-server tail pidfiles, byte-offset cursors,
+> dedup windows, log-parsing branches — and threading a config layer through
+> all of it would have touched nearly every line for no benefit to me. It was
+> too bulky and too complex to be worth optimising for portability or
+> customizability.
+>
+> **What that means in practice:** the handful of paths at the top of the
+> script are meant to be edited by hand (or patched with `sed`), not
+> configured. If you need it somewhere else, fork it and change the variables —
+> don't expect upstream to grow options. `mc-go` is the one that got the
+> proper treatment because its layout was small enough to factor out cleanly.
+
 ## Requirements
 
 - POSIX `sh` (dash, busybox ash, bash — anything)
@@ -27,7 +44,8 @@ sudo rc-update add mc-watcher default
 sudo rc-service mc-watcher start
 ```
 
-No config file — paths are variables at the top of the script (`LOG_DIR`, `SOUNDS_DIR`, `EVENTS_FILE`, `STATE_DIR`).
+No config file — by design (see the notice at the top). Paths are variables at
+the top of the script (`LOG_DIR`, `SOUNDS_DIR`, `EVENTS_FILE`, `STATE_DIR`).
 
 ## How it works
 
@@ -54,6 +72,10 @@ my local ntfy. Either provide equivalents, or drop them — notifications fail
 silently (both are `&`/`command -v` guarded), so the watcher still runs.
 
 ## Portability
+
+> **This section is a map, not an invitation.** See the notice at the top:
+> portability was explicitly descoped for this project. The variables below are
+> where a fork would start, not a supported configuration surface.
 
 Paths and assumptions are variables at the top of `mc-watcher`
 (`LOG_DIR`, `WATCHER_LOG`, `SOUNDS_DIR`, `EVENTS_FILE`, `STATE_DIR`), but
