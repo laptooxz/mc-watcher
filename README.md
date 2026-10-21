@@ -4,6 +4,12 @@ A lightweight Minecraft server log watcher daemon in a single POSIX shell script
 
 > **yep this is vibecoded aswell**
 
+> **Built for one homelab.** This is written for and tested only on `laptoo`
+> (Alpine Linux, OpenRC, `~/mc/<server>`, my own paths). It can be adapted to
+> other systems — see [Portability](#portability) — but it is not portable
+> as-is, and it has no CI, no test suite and no security audit. Read the source
+> before running it anywhere that matters.
+
 ## Requirements
 
 - POSIX `sh` (dash, busybox ash, bash — anything)
@@ -40,6 +46,29 @@ No config file — paths are variables at the top of the script (`LOG_DIR`, `SOU
 ### `hostenv`
 
 Desktop/sound delivery goes through a `hostenv` helper that locates the login session's `DBUS_SESSION_BUS_ADDRESS` and `PULSE_SERVER`, so the daemon can reach the user's GUI. If you don't need desktop notifications, just make sure `notify-send` isn't on `PATH`.
+
+**`hostenv` and `ntfy-push` are not part of this repo.** They live in my
+dotfiles: `hostenv` wraps a command with the desktop session's environment,
+and `ntfy-push <topic> <title> <message> [priority] [markdown]` publishes to
+my local ntfy. Either provide equivalents, or drop them — notifications fail
+silently (both are `&`/`command -v` guarded), so the watcher still runs.
+
+## Portability
+
+Paths and assumptions are variables at the top of `mc-watcher`
+(`LOG_DIR`, `WATCHER_LOG`, `SOUNDS_DIR`, `EVENTS_FILE`, `STATE_DIR`), but
+`HOME` and `PATH` are also hardcoded (`export HOME=/home/main`). The script
+additionally assumes:
+
+- servers live in `~/mc/<server>` and tmux sessions are named `mc-<server>`
+- logs are at `<server>/logs/latest.log`
+- Minecraft sounds are in `~/mc/library/sounds`
+- the events log goes to `/srv/logs/mc_events.jsonl`
+- `openrc/mc-watcher` is an OpenRC `supervise-daemon` wrapper
+
+Change those variables (and write a unit for your init system) to run it
+elsewhere. The log parsers themselves are Paper/Fabric-specific but not
+distro-specific.
 
 ## Parsing notes (Paper + Fabric)
 
